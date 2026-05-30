@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Flyt-Pi ROS2 node: send low-resolution RGB frames to RTX inference server.
+
+Depth stays on the robot. The RTX laptop only receives RGB and returns YOLO
+bounding boxes. Local high-resolution aligned depth is used by target_depth_follower.
+"""
+
+import socket
+import time
+from typing import Optional
+
+import cv2
+import rclpy
+from cv_bridge import CvBridge
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
+
+from .protocol import send_frame
+
+
+class RGBSender(Node):
+    def __init__(self):
+        super().__init__('rgb_sender')
+
+        self.declare_parameter('host', '192.168.43.178')
+        self.declare_parameter('port', 9999)
+        self.declare_parameter('image_topic', '/camera/color/image_raw')
+        self.declare_parameter('send_width', 480)
+        self.declare_parameter('send_height', 270)
+        self.declare_parameter('jpeg_quality', 60)
+        self.declare_parameter('max_fps', 15.0)
+        self.declare_parameter('connect_retry_sec', 2.0)
+
+        self.host = str(self.get_parameter('host').value)
+        self.port = int(self.get_parameter('port').value)
+        self.image_topic = str(self.get_parameter('image_topic').value)
+        self.send_width = int(self.get_parameter('send_width').value)
+        self.send_height = int(self.get_parameter('send_height').value)
+        self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
+        self.max_fps = float(self.get_parameter('max_fps').value)
+        self.connect_retry_sec = float(self.get_parameter('connect_retry_sec').value)
+
+        self.bridge = CvBridge()
+        self.sock: Optional[socket.socket] = None
+        self.connected = False
+        self.last_send_time = 0.0
+        self.frame_seq = 0
+
+        self.create_timer(self.connect_retry_sec, self.try_connect)
+        self.create_subscription(Image, self.image_topic, self.image_callback, qos_profile_sensor_data)
+
+        self.get_logger().info(
+            f'RGB sender started: topic={self.image_topic}, server={self.host}:{self.port}, '
+            f'size={self.send_width}x{self.send_height}, max_fps={self.max_fps}'
+        )
+
+    def try_connect(self):
+        if self.connected:
+            return
+        self.close_socket()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3.0)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.connect((self.host, self.port))
+            sock.settimeout(None)
+            self.sock = sock
+            self.connected = True
+            self.get_logger().info(f'✅ RGB connected to {self.host}:{self.port}')
+        except Exception as exc:
+            self.connected = False
+            self.sock = None
+            self.get_logger().warn(f'waiting RGB server {self.host}:{self.port}: {exc}', throttle_duration_sec=5.0)
+
+    def close_socket(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        self.sock = None
+        self.connected = False
+
+    def image_callback(self, msg: Image):
+        if not self.connected or self.sock is None:
+            return
+
+        now = time.time()
+        if self.max_fps > 0 and (now - self.last_send_time) < (1.0 / self.max_fps):
+            return
+        self.last_send_time = now
+
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            src_h, src_w = img.shape[:2]
+            if self.send_width > 0 and self.send_height > 0:
+                img = cv2.resize(img, (self.send_width, self.send_height), interpolation=cv2.INTER_AREA)
+
+            ok, jpeg = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            if not ok:
+                self.get_logger().warn('JPEG encode failed', throttle_duration_sec=2.0)
+                return
+
+            header = {
+                'type': 'rgb',
+                'seq': self.frame_seq,
+                'stamp_sec': int(msg.header.stamp.sec),
+                'stamp_nanosec': int(msg.header.stamp.nanosec),
+                'frame_id': msg.header.frame_id,
+                'src_width': int(src_w),
+                'src_height': int(src_h),
+                'width': int(img.shape[1]),
+                'height': int(img.shape[0]),
+                'encoding': 'jpeg_bgr8',
+            }
+            send_frame(self.sock, header, jpeg.tobytes())
+            self.frame_seq += 1
+        except Exception as exc:
+            self.get_logger().warn(f'RGB send failed, reconnecting: {exc}')
+            self.close_socket()
+
+
+def main():
+    rclpy.init()
+    node = RGBSender()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.close_socket()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

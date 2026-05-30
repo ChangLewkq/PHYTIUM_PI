@@ -1,0 +1,28 @@
+rgb_sender:
+  ros__parameters:
+    host: "192.168.43.178"
+    port: 9999
+    image_topic: "/camera/color/image_raw"
+    send_width: 416
+    send_height: 234
+    jpeg_quality: 60
+    max_fps: 10.0
+
+target_depth_follower:
+  ros__parameters:
+    host: "0.0.0.0"
+    port: 9997
+    depth_topic: "/camera/aligned_depth_to_color/image_raw"
+    target_class: "person"
+    target_distance: 1.0
+    distance_deadband: 0.12
+    too_close_distance: 0.45
+    roi_scale: 0.35
+    cmd_vel_topic: "/cmd_vel_follow"
+    publish_cmd: true
+    max_linear: 0.12
+    max_reverse: 0.05
+    max_angular: 0.35
+    linear_kp: 0.22
+    angular_kp: 0.35
+    stop_when_lost: true

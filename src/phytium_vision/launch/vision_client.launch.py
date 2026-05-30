@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Low-load vision client launch for Flyt-Pi.
+
+Starts:
+1. RealSense D435i
+2. RGB sender to RTX3050
+3. Target depth follower
+
+Output:
+- /cmd_vel_follow, not /cmd_vel
+
+Notes:
+- This version uses RealSense profile parameters:
+  rgb_camera.profile and depth_module.profile
+- rgb_sender is set to 416x234 @ 10 FPS
+- Default RTX3050 host is 192.168.43.163
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    inference_host_arg = DeclareLaunchArgument(
+        "inference_host",
+        default_value="192.168.43.163",
+        description="RTX3050 inference host IP address"
+    )
+
+    rgb_port_arg = DeclareLaunchArgument(
+        "rgb_port",
+        default_value="9999"
+    )
+
+    bbox_port_arg = DeclareLaunchArgument(
+        "bbox_port",
+        default_value="9997"
+    )
+
+    target_class_arg = DeclareLaunchArgument(
+        "target_class",
+        default_value="person"
+    )
+
+    realsense257_env = SetEnvironmentVariable(
+        name="LD_LIBRARY_PATH",
+        value="/home/user/realsense257_install/lib:/opt/ros/foxy/lib/aarch64-linux-gnu:/opt/ros/foxy/lib"
+    )
+
+    realsense_node = Node(
+        package="realsense2_camera",
+        executable="realsense2_camera_node",
+        namespace="camera",
+        name="camera",
+        output="screen",
+        parameters=[{
+            "enable_color": True,
+            "enable_depth": True,
+
+            "enable_infra1": False,
+            "enable_infra2": False,
+            "enable_accel": False,
+            "enable_gyro": False,
+
+            "align_depth.enable": True,
+            "pointcloud.enable": False,
+
+            # RealSense ROS2 wrapper profile format.
+            "rgb_camera.profile": "424x240x15",
+            "depth_module.profile": "424x240x15",
+
+            "initial_reset": True,
+
+            # Avoid unsupported value 3 warning.
+            "rgb_camera.power_line_frequency": 2,
+        }]
+    )
+
+    rgb_sender_node = Node(
+        package="phytium_vision",
+        executable="rgb_sender",
+        name="rgb_sender",
+        output="screen",
+        parameters=[{
+            "host": LaunchConfiguration("inference_host"),
+            "port": LaunchConfiguration("rgb_port"),
+            "image_topic": "/camera/color/image_raw",
+
+            "send_width": 416,
+            "send_height": 234,
+            "jpeg_quality": 55,
+            "max_fps": 10.0,
+        }],
+    )
+
+    target_depth_follower_node = Node(
+        package="phytium_vision",
+        executable="target_depth_follower",
+        name="target_depth_follower",
+        output="screen",
+        parameters=[{
+            "host": "0.0.0.0",
+            "port": LaunchConfiguration("bbox_port"),
+            "depth_topic": "/camera/aligned_depth_to_color/image_raw",
+            "target_class": LaunchConfiguration("target_class"),
+
+            "target_distance": 1.0,
+            "distance_deadband": 0.12,
+            "too_close_distance": 0.45,
+            "roi_scale": 0.35,
+
+            "cmd_vel_topic": "/cmd_vel_follow",
+            "publish_cmd": True,
+
+            "max_linear": 0.10,
+            "max_reverse": 0.04,
+            "max_angular": 0.30,
+
+            "linear_kp": 0.20,
+            "angular_kp": 0.32,
+            "stop_when_lost": True,
+        }],
+    )
+
+    return LaunchDescription([
+        inference_host_arg,
+        rgb_port_arg,
+        bbox_port_arg,
+        target_class_arg,
+        realsense257_env,
+        realsense_node,
+        rgb_sender_node,
+        target_depth_follower_node,
+    ])

@@ -1,0 +1,8 @@
+web_server:
+  ros__parameters:
+    host: '0.0.0.0'
+    port: 5000
+    yolo_receiver_url: 'http://192.168.43.163:8080'
+    cmd_topic: '/cmd_vel_web'
+    max_linear: 0.20
+    max_angular: 0.60

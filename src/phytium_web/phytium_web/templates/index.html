@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>飞腾派 ROS2 智能小车总控台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=transitionfix1">
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">P</div>
+      <div>
+        <h1>飞腾派 ROS2 智能小车总控台</h1>
+        <p>Phytium Pi + STM32 + D6 LiDAR + D435i + RTX3050</p>
+      </div>
+    </div>
+
+    <div class="header-status">
+      <div class="status-pill" id="global-safety-pill">
+        <span class="dot" id="node-safety"></span>
+        <span id="global-safety-text">安全层等待</span>
+      </div>
+      <div class="status-pill">
+        <span>控制源</span>
+        <b id="active-source-top">--</b>
+      </div>
+      <div class="status-pill">
+        <span>车头净空</span>
+        <b id="front-clearance-top">--</b>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="left-column">
+      <div class="card">
+        <div class="card-title">
+          <span>系统在线</span>
+          <small id="node-count">-- nodes</small>
+        </div>
+
+        <div class="status-grid compact">
+          <div><span id="node-uart" class="dot"></span>底盘</div>
+          <div><span id="node-safety-left" class="dot"></span>安全层</div>
+          <div><span id="node-mux" class="dot"></span>速度仲裁</div>
+          <div><span id="radar-online" class="dot"></span>D6 雷达</div>
+          <div><span id="node-camera" class="dot"></span>D435i</div>
+          <div><span id="node-rgb" class="dot"></span>RGB 发送</div>
+          <div><span id="node-target" class="dot"></span>目标节点</div>
+          <div><span id="remote-online" class="dot"></span>RTX3050</div>
+          <div><span id="node-slam" class="dot"></span>SLAM</div>
+          <div><span id="node-nav2" class="dot"></span>Nav2</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>飞腾派性能</span>
+          <small>edge</small>
+        </div>
+
+        <div class="metric"><span>CPU</span><b id="cpu">--%</b></div>
+        <div class="bar"><i id="cpu-bar"></i></div>
+
+        <div class="metric"><span>内存</span><b id="mem">--%</b></div>
+        <div class="bar"><i id="mem-bar"></i></div>
+
+        <div class="metric"><span>温度</span><b id="temp">-- ℃</b></div>
+        <div class="metric"><span>磁盘</span><b id="disk">--%</b></div>
+        <div class="metric"><span>网络发送</span><b id="tx">-- kbps</b></div>
+        <div class="metric"><span>网络接收</span><b id="rx">-- kbps</b></div>
+
+        <div class="cores" id="cores"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>RTX3050 推理</span>
+          <small id="remote-device">--</small>
+        </div>
+
+        <div class="remote-model" id="remote-model">未连接</div>
+
+        <div class="triple">
+          <div>
+            <b id="remote-fps">0.0</b>
+            <span>FPS</span>
+          </div>
+
+          <div>
+            <b id="remote-ms">0.0</b>
+            <span>ms</span>
+          </div>
+
+          <div>
+            <b id="remote-count">0</b>
+            <span>目标</span>
+          </div>
+        </div>
+
+        <div class="metric"><span>RGB接收</span><b id="remote-rgb-fps">0.0 FPS</b></div>
+        <div class="metric"><span>最近帧</span><b id="remote-age">--</b></div>
+
+        <div class="device-buttons">
+          <button onclick="switchDevice('gpu')">GPU</button>
+          <button onclick="switchDevice('cpu')">CPU</button>
+        </div>
+      </div>
+
+      
+
+      
+    
+
+      
+
+      
+
+      
+
+
+      <div class="card task-card mode-context-card" id="mapTaskCard">
+        <div class="card-title">
+          <span>建图任务</span>
+          <small>/home/user/maps</small>
+        </div>
+
+        <label class="field-label" for="map-name">地图名称</label>
+        <div class="save-row">
+          <input id="map-name" type="text" value="my_map" maxlength="64" />
+          <button id="save-map-btn" onclick="saveMap()">保存地图</button>
+        </div>
+
+        <div class="save-status" id="map-save-status">等待保存</div>
+
+        <p class="hint">保存当前 /map 到 /home/user/maps，生成 .yaml 和 .pgm 文件。</p>
+      </div>
+
+      <div class="card mode-context-card" id="navGoalCard">
+        <div class="card-title">
+          <span>导航点设置</span>
+          <small>Nav2 goal</small>
+        </div>
+        <div id="nav-goal-tools" class="nav-goal-tools">
+            <button id="btn-nav-single" type="button" class="nav-goal-btn">单点导航</button>
+            <button id="btn-nav-multi" type="button" class="nav-goal-btn">多点导航</button>
+            <button id="btn-nav-finish" type="button" class="nav-goal-btn confirm" disabled>确认多点导航</button>
+            <button id="btn-nav-clear" type="button" class="nav-goal-btn ghost">清空选择</button>
+            <div id="nav-goal-status" class="nav-goal-status">导航点：未选择</div>
+          </div>
+        <p class="hint">单点导航选择 1 个目标点；多点导航按顺序选择多个目标点，确认后再开始导航。</p>
+      </div>
+
+      <div class="card mode-context-card" id="followTargetCard">
+        <div class="card-title">
+          <span>视觉跟随目标</span>
+          <small>D435i + RTX3050</small>
+        </div>
+
+        <label class="field-label" for="follow-target-select">跟随目标</label>
+        <div class="follow-target-row">
+          <select id="follow-target-select">
+            <option value="person">person / 人</option>
+            <option value="bottle">bottle / 瓶子</option>
+            <option value="chair">chair / 椅子</option>
+            <option value="custom">custom / 自定义</option>
+          </select>
+          <button id="follow-target-confirm" type="button">确认跟随</button>
+        </div>
+
+        <div class="save-status" id="follow-target-status">等待选择目标</div>
+        <p class="hint">选择目标类别后确认跟随；后续可接入云端识别类别过滤。</p>
+      </div>
+</section>
+
+    <section class="center-column">
+      <div class="scene-grid">
+        <div class="video-card" id="videoCard">
+          <div class="panel-title">
+            <span>视觉检测画面</span>
+            <span id="video-state">等待视频流</span>
+          </div>
+          <img id="video" alt="等待 RTX3050 视频流"/>
+        </div>
+
+        <div class="radar-card" id="radarCard">
+          <div class="panel-title">
+            <span>D6 雷达点云</span>
+            <span id="radar-state">等待 /scan</span>
+          </div>
+
+          <div class="radar-wrap">
+            <canvas id="radarCanvas"></canvas>
+
+            <div class="radar-legend">
+              <div>绿色：4m 内雷达点云</div>
+              <div>橙圈：最近障碍</div>
+              <div>上方：车头方向</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="map-card" id="mapCard">
+          <div class="panel-title">
+            <span>SLAM / Nav2 地图</span>
+            <span id="map-state">等待 /map</span>
+          </div>
+
+          <div class="map-wrap">
+            <canvas id="mapCanvas"></canvas>
+
+            <div class="map-legend">
+              <div>黑色：障碍物 / 墙体</div>
+              <div>白色：可通行区域</div>
+              <div>灰色：未知区域</div>
+              <div>绿色箭头：机器人位姿</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="dashboard-strip">
+        <div class="card mini-panel safety-panel">
+          <div class="card-title">
+            <span>安全与净空</span>
+            <small id="safety-state">--</small>
+          </div>
+
+          <div class="hero-value">
+            <span>车头净空</span>
+            <b id="safety-clearance">-- m</b>
+          </div>
+
+          <div class="target-line"><span>雷达到障碍</span><b id="safety-front-min">-- m</b></div>
+          <div class="target-line"><span>偏移补偿</span><b id="safety-offset">-- m</b></div>
+          <div class="target-line"><span>安全原因</span><b id="safety-reason">--</b></div>
+          <div class="target-line"><span>输出速度</span><b id="safety-output">0.00 / 0.00</b></div>
+          <div class="target-line"><span>地图尺寸</span><b id="map-size">--</b></div>
+        </div>
+
+        <div class="card mini-panel perception-panel">
+          <div class="card-title">
+            <span>感知与跟随</span>
+            <small id="target-online-label">--</small>
+          </div>
+
+          <div class="hero-value">
+            <span>目标</span>
+            <b id="target-class">--</b>
+          </div>
+
+          <div class="target-line"><span>置信度</span><b id="target-conf">--</b></div>
+          <div class="target-line"><span>目标距离</span><b id="target-dist">-- m</b></div>
+          <div class="target-line"><span>画面偏移</span><b id="target-offset">--</b></div>
+          <div class="target-line"><span>跟随速度</span><b id="follow-output">0.000 / 0.000</b></div>
+        </div>
+
+        <div class="card mini-panel chassis-panel">
+          <div class="card-title">
+            <span>底盘与里程计</span>
+            <small id="robot-online-label">--</small>
+          </div>
+
+          <div class="hero-value">
+            <span>当前速度</span>
+            <b id="robot-speed">0.00 m/s</b>
+          </div>
+
+          <div class="target-line"><span>角速度</span><b id="robot-angular">0.00 rad/s</b></div>
+          <div class="target-line"><span>位置</span><b id="robot-pos">0,0</b></div>
+          <div class="target-line"><span>航向</span><b id="robot-heading">0°</b></div>
+          <div class="target-line"><span>Gyro Z</span><b id="robot-gyro">0</b></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="right-column">
+      <div class="card mode-card">
+        <div class="card-title">
+          <span>功能模式</span>
+          <small id="mode-status">待命</small>
+        </div>
+
+        <div class="mode-action-grid">
+          <button class="mode-action active" data-mode="manual" data-label="手动控制">
+            <b>手动</b>
+            <span>Web / 键盘控制</span>
+          </button>
+
+          <button class="mode-action" data-mode="follow" data-label="视觉跟随">
+            <b>视觉跟随</b>
+            <span>D435i + RTX3050</span>
+          </button>
+
+          <button class="mode-action" data-mode="mapping" data-label="建图">
+            <b>建图</b>
+            <span>SLAM Toolbox</span>
+          </button>
+
+          <button class="mode-action" data-mode="navigation" data-label="导航">
+            <b>导航</b>
+            <span>Nav2 目标点</span>
+          </button>
+
+          
+
+          <button class="mode-action stop-mode" data-mode="stop" data-label="停止">
+            <b>停止</b>
+            <span>切断运动输出</span>
+          </button>
+        </div>
+
+        <div class="switch-meter" id="switch-meter">
+          <div class="switch-meter-head">
+            <span id="switch-phase">待命</span>
+            <b id="switch-time">0.00s</b>
+          </div>
+          <div class="switch-progress" id="switch-progress"><i id="switch-progress-bar"></i></div>
+          <div class="switch-detail" id="switch-detail">等待模式切换</div>
+        </div>
+        <p class="hint">热切换会自动检测任务是否就绪，并显示实际耗时。</p>
+      </div>
+
+      <div class="card task-status-card">
+        <div class="card-title">
+          <span>热切换任务</span>
+          <small>按需启动</small>
+        </div>
+
+        <div class="task-status-row">
+          <span>视觉跟随</span>
+          <b id="task-vision">停止</b>
+        </div>
+        <div class="task-status-row">
+          <span>SLAM 建图</span>
+          <b id="task-mapping">停止</b>
+        </div>
+        <div class="task-status-row">
+          <span>Nav2 导航</span>
+          <b id="task-navigation">停止</b>
+        </div>
+
+        <button class="task-stop-all" onclick="stopAllTasks()">关闭全部功能任务</button>
+
+        <p class="hint">基础节点常驻；视觉、建图、导航根据模式按需启动。</p>
+      </div>
+
+
+      
+
+
+      <div class="card control-card">
+        <div class="card-title">
+          <span>Web 手动控制</span>
+          <small>hold-to-run</small>
+        </div>
+
+        <div class="dpad">
+          <button></button>
+
+          <button
+            onpointerdown="startHoldCmd(0.045, 0.0, event)"
+            onpointerup="stopHoldCmd(event)"
+            onpointerleave="stopHoldCmd(event)"
+            onpointercancel="stopHoldCmd(event)"
+          >▲</button>
+
+          <button></button>
+
+          <button
+            onpointerdown="startHoldCmd(0.0, 0.250, event)"
+            onpointerup="stopHoldCmd(event)"
+            onpointerleave="stopHoldCmd(event)"
+            onpointercancel="stopHoldCmd(event)"
+          >◀</button>
+
+          <button onclick="stopHoldCmd(event)">停</button>
+
+          <button
+            onpointerdown="startHoldCmd(0.0, -0.250, event)"
+            onpointerup="stopHoldCmd(event)"
+            onpointerleave="stopHoldCmd(event)"
+            onpointercancel="stopHoldCmd(event)"
+          >▶</button>
+
+          <button></button>
+
+          <button
+            onpointerdown="startHoldCmd(-0.045, 0.0, event)"
+            onpointerup="stopHoldCmd(event)"
+            onpointerleave="stopHoldCmd(event)"
+            onpointercancel="stopHoldCmd(event)"
+          >▼</button>
+
+          <button></button>
+        </div>
+
+        <div class="danger-row">
+          <button class="estop" onclick="estop()">急停</button>
+          <button class="release" onclick="releaseEstop()">解除</button>
+        </div>
+
+        <p class="hint">按住方向键持续运动，松开立即停车；速度先进入 /cmd_vel_web，再经 mux 与 safety_guard。</p>
+      </div>
+
+    </section>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="{{ url_for('static', filename='app.js') }}?v=transitionfix1"></script>
+</body>
+</html>

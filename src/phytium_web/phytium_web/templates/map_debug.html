@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Map Debug</title>
+  <style>
+    body{margin:0;background:#07111f;color:#e6f0ff;font-family:Segoe UI,Arial,sans-serif}
+    header{height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 18px;background:#101d31;border-bottom:1px solid #263b55}
+    main{height:calc(100vh - 56px);display:grid;grid-template-columns:1fr 320px;gap:12px;padding:12px}
+    .panel{background:#101d31;border:1px solid #263b55;border-radius:16px;overflow:hidden}
+    canvas{width:100%;height:100%;display:block;background:#050b14}
+    pre{white-space:pre-wrap;font-size:13px;line-height:1.5;padding:14px;margin:0;color:#b7d4ee}
+    button{background:#22c55e;color:#03110a;border:0;border-radius:10px;padding:8px 12px;font-weight:800}
+    a{color:#38bdf8}
+  </style>
+</head>
+<body>
+<header>
+  <b>SLAM /map Debug</b>
+  <div><a href="/">返回总控台</a> <button onclick="refresh()">刷新</button></div>
+</header>
+<main>
+  <div class="panel"><canvas id="c"></canvas></div>
+  <div class="panel"><pre id="info">loading...</pre></div>
+</main>
+<script>
+const c=document.getElementById('c');
+const ctx=c.getContext('2d');
+let lastMap=null;
+
+function fitCanvas(){
+  const r=c.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  c.width=Math.max(1,Math.floor(r.width*dpr));
+  c.height=Math.max(1,Math.floor(r.height*dpr));
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  if(lastMap) draw(lastMap);
+}
+window.addEventListener('resize',fitCanvas);
+
+function color(v){
+  if(v<0)return [45,55,72,255];
+  if(v>=65)return [2,6,23,255];
+  if(v>=25)return [100,116,139,255];
+  return [226,232,240,255];
+}
+function drawRobot(map,ox,oy,scale,mh){
+  if(!map.robot_pose_online)return;
+  const res=Number(map.display_resolution||map.resolution||0.05);
+  const x=(Number(map.robot_x)-Number(map.origin_x||0))/res;
+  const y=(Number(map.robot_y)-Number(map.origin_y||0))/res;
+  if(!Number.isFinite(x)||!Number.isFinite(y)||res<=0)return;
+  const px=ox+x*scale, py=oy+(mh-y)*scale;
+  ctx.save();
+  ctx.translate(px,py);
+  ctx.rotate(-Number(map.robot_yaw||0)-Math.PI/2);
+  ctx.fillStyle='#22c55e';
+  ctx.beginPath();ctx.moveTo(0,-14);ctx.lineTo(9,10);ctx.lineTo(0,5);ctx.lineTo(-9,10);ctx.closePath();ctx.fill();
+  ctx.restore();
+}
+function draw(map){
+  lastMap=map;
+  const r=c.getBoundingClientRect();
+  const w=r.width,h=r.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle='#050b14';ctx.fillRect(0,0,w,h);
+  if(!map||!map.online||!map.data||!map.display_width||!map.display_height){
+    ctx.fillStyle='#f59e0b';ctx.font='18px Segoe UI';ctx.fillText('No /map in /api/state',20,35);return;
+  }
+  const mw=Number(map.display_width),mh=Number(map.display_height),data=map.data;
+  const img=ctx.createImageData(mw,mh);
+  for(let y=0;y<mh;y++){
+    for(let x=0;x<mw;x++){
+      const v=Number(data[y*mw+x]);
+      const sy=mh-1-y;
+      const p=(sy*mw+x)*4;
+      const col=color(v);
+      img.data[p]=col[0];img.data[p+1]=col[1];img.data[p+2]=col[2];img.data[p+3]=255;
+    }
+  }
+  const off=document.createElement('canvas');
+  off.width=mw;off.height=mh;
+  off.getContext('2d').putImageData(img,0,0);
+  const scale=Math.min(w/mw,h/mh)*0.94;
+  const ox=(w-mw*scale)/2,oy=(h-mh*scale)/2;
+  ctx.imageSmoothingEnabled=false;
+  ctx.drawImage(off,ox,oy,mw*scale,mh*scale);
+  ctx.strokeStyle='#38bdf8';ctx.strokeRect(ox,oy,mw*scale,mh*scale);
+  drawRobot(map,ox,oy,scale,mh);
+}
+async function refresh(){
+  const m=await fetch('/api/map?ts='+Date.now()).then(r=>r.json());
+  const s={mode:'map_debug'};
+  document.getElementById('info').textContent =
+`mode=${s.mode}
+map.online=${m.online}
+size=${m.width} x ${m.height}
+display=${m.display_width} x ${m.display_height}
+data_count=${(m.data||[]).length}
+resolution=${m.resolution}
+display_resolution=${m.display_resolution}
+origin=(${m.origin_x}, ${m.origin_y})
+robot_pose_online=${m.robot_pose_online}
+robot=(${m.robot_x}, ${m.robot_y}) yaw=${m.robot_yaw_deg}
+`;
+  draw(m);
+}
+fitCanvas();
+setInterval(refresh,1000);
+refresh();
+</script>
+</body>
+</html>

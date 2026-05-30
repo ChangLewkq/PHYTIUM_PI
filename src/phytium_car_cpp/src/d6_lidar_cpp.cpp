@@ -1,0 +1,403 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace
+{
+constexpr uint8_t H0 = 0xAA;
+constexpr uint8_t H1 = 0x55;
+constexpr double PI = 3.14159265358979323846;
+
+speed_t baud_to_termios(int baud)
+{
+  switch (baud)
+  {
+    case 9600: return B9600;
+    case 19200: return B19200;
+    case 38400: return B38400;
+    case 57600: return B57600;
+    case 115200: return B115200;
+    case 230400: return B230400;
+#ifdef B460800
+    case 460800: return B460800;
+#endif
+#ifdef B921600
+    case 921600: return B921600;
+#endif
+    default: return B230400;
+  }
+}
+
+double normalize_deg(double a)
+{
+  while (a >= 360.0) a -= 360.0;
+  while (a < 0.0) a += 360.0;
+  return a;
+}
+
+int angle_to_bin(double deg, int bins)
+{
+  deg = normalize_deg(deg);
+  int idx = static_cast<int>(std::round(deg));
+  if (idx >= bins) idx -= bins;
+  if (idx < 0) idx += bins;
+  return idx;
+}
+}  // namespace
+
+class D6LidarCpp : public rclcpp::Node
+{
+public:
+  D6LidarCpp()
+  : Node("d6_lidar_cpp")
+  {
+    port_ = declare_parameter<std::string>("port", "/dev/phytium_d6_lidar");
+    baud_ = declare_parameter<int>("baudrate", 230400);
+    frame_id_ = declare_parameter<std::string>("frame_id", "laser_link");
+    topic_ = declare_parameter<std::string>("topic", "/scan");
+    publish_hz_ = declare_parameter<double>("publish_hz", 10.0);
+    read_period_s_ = declare_parameter<double>("read_period", 0.005);
+    bins_ = declare_parameter<int>("bins", 360);
+    range_min_ = declare_parameter<double>("range_min", 0.02);
+    range_max_ = declare_parameter<double>("range_max", 15.0);
+    min_points_before_publish_ = declare_parameter<int>("min_points_before_publish", 120);
+    publish_empty_scan_ = declare_parameter<bool>("publish_empty_scan", true);
+
+    if (bins_ <= 0)
+    {
+      throw std::runtime_error("bins must be positive");
+    }
+
+    ranges_.assign(static_cast<size_t>(bins_), range_max_);
+    intensities_.assign(static_cast<size_t>(bins_), 0.0f);
+    touched_.assign(static_cast<size_t>(bins_), false);
+
+    scan_time_offset_sec_ = declare_parameter<double>("scan_time_offset_sec", 0.30);
+    pub_ = create_publisher<sensor_msgs::msg::LaserScan>(topic_, rclcpp::QoS(10));
+
+    open_serial();
+
+    read_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(read_period_s_)),
+      std::bind(&D6LidarCpp::read_timer_cb, this));
+
+    publish_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.0 / std::max(1.0, publish_hz_))),
+      std::bind(&D6LidarCpp::publish_timer_cb, this));
+
+    RCLCPP_INFO(
+      get_logger(),
+      "D6 optimized C++ driver started: port=%s, baud=%d, publish_hz=%.1f, bins=%d, read_period=%.3fs",
+      port_.c_str(), baud_, publish_hz_, bins_, read_period_s_);
+  }
+
+  ~D6LidarCpp() override
+  {
+    if (fd_ >= 0)
+    {
+      close(fd_);
+      fd_ = -1;
+    }
+  }
+
+private:
+  void open_serial()
+  {
+    fd_ = ::open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd_ < 0)
+    {
+      RCLCPP_ERROR(get_logger(), "Failed to open D6 port %s: %s", port_.c_str(), strerror(errno));
+      throw std::runtime_error("open serial failed");
+    }
+
+    termios tty{};
+    if (tcgetattr(fd_, &tty) != 0)
+    {
+      RCLCPP_ERROR(get_logger(), "tcgetattr failed: %s", strerror(errno));
+      throw std::runtime_error("tcgetattr failed");
+    }
+
+    cfmakeraw(&tty);
+
+    speed_t speed = baud_to_termios(baud_);
+    cfsetispeed(&tty, speed);
+    cfsetospeed(&tty, speed);
+
+    tty.c_cflag |= (CLOCAL | CREAD);
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8;
+    tty.c_cflag &= ~PARENB;
+    tty.c_cflag &= ~CSTOPB;
+    tty.c_cflag &= ~CRTSCTS;
+
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 0;
+
+    tcflush(fd_, TCIOFLUSH);
+
+    if (tcsetattr(fd_, TCSANOW, &tty) != 0)
+    {
+      RCLCPP_ERROR(get_logger(), "tcsetattr failed: %s", strerror(errno));
+      throw std::runtime_error("tcsetattr failed");
+    }
+  }
+
+  void read_timer_cb()
+  {
+    if (fd_ < 0)
+    {
+      return;
+    }
+
+    uint8_t tmp[512];
+    while (true)
+    {
+      ssize_t n = ::read(fd_, tmp, sizeof(tmp));
+      if (n > 0)
+      {
+        for (ssize_t i = 0; i < n; ++i)
+        {
+          buf_.push_back(tmp[i]);
+        }
+      }
+      else
+      {
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "D6 read error: %s", strerror(errno));
+        }
+        break;
+      }
+    }
+
+    parse_buffer();
+
+    if (buf_.size() > 8192)
+    {
+      buf_.clear();
+      RCLCPP_WARN(get_logger(), "D6 rx buffer overflow, cleared");
+    }
+  }
+
+  void parse_buffer()
+  {
+    while (buf_.size() >= 10)
+    {
+      if (buf_[0] != H0 || buf_[1] != H1)
+      {
+        buf_.pop_front();
+        continue;
+      }
+
+      const uint8_t n = buf_[3];
+      if (n == 0 || n > 160)
+      {
+        buf_.pop_front();
+        continue;
+      }
+
+      const size_t total = 10 + static_cast<size_t>(n) * 3;
+      if (buf_.size() < total)
+      {
+        break;
+      }
+
+      std::vector<uint8_t> frame(total);
+      for (size_t i = 0; i < total; ++i)
+      {
+        frame[i] = buf_[i];
+      }
+
+      for (size_t i = 0; i < total; ++i)
+      {
+        buf_.pop_front();
+      }
+
+      parse_packet(frame);
+    }
+  }
+
+  void parse_packet(const std::vector<uint8_t> &frame)
+  {
+    if (frame.size() < 10)
+    {
+      return;
+    }
+
+    const int n = static_cast<int>(frame[3]);
+    const size_t total = 10 + static_cast<size_t>(n) * 3;
+    if (frame.size() < total)
+    {
+      return;
+    }
+
+    const double fa = static_cast<double>(((frame[4] | (frame[5] << 8)) >> 1)) / 64.0;
+    const double la = static_cast<double>(((frame[6] | (frame[7] << 8)) >> 1)) / 64.0;
+    const double span = (la < fa) ? (360.0 + la - fa) : (la - fa);
+
+    for (int i = 0; i < n; ++i)
+    {
+      const size_t idx = 10 + static_cast<size_t>(i) * 3;
+      const uint16_t raw = (static_cast<uint16_t>(frame[idx + 2]) << 8) | frame[idx + 1];
+      const double rng = static_cast<double>(raw >> 2) / 1000.0;
+      double ang = (n > 1) ? (fa + span * static_cast<double>(i) / static_cast<double>(n - 1)) : fa;
+      ang = normalize_deg(ang);
+
+      const float intensity = static_cast<float>(frame[idx] & 0x3F);
+
+      if (rng < range_min_ || rng > range_max_ || !std::isfinite(rng))
+      {
+        continue;
+      }
+
+      bin_point(ang, static_cast<float>(rng), intensity);
+    }
+
+    packet_count_++;
+  }
+
+  void bin_point(double angle_deg, float range_m, float intensity)
+  {
+    int bin = angle_to_bin(angle_deg, bins_);
+    if (bin < 0 || bin >= bins_)
+    {
+      return;
+    }
+
+    const size_t i = static_cast<size_t>(bin);
+
+    /*
+     * If multiple points fall into the same 1-degree bin,
+     * keep the nearest valid range. This is usually safer for obstacle use.
+     */
+    if (!touched_[i] || range_m < ranges_[i])
+    {
+      ranges_[i] = range_m;
+      intensities_[i] = intensity;
+      touched_[i] = true;
+    }
+
+    points_since_publish_++;
+  }
+
+  void publish_timer_cb()
+  {
+    if (!publish_empty_scan_ && points_since_publish_ < min_points_before_publish_)
+    {
+      return;
+    }
+
+    sensor_msgs::msg::LaserScan msg;
+    auto scan_stamp = now();
+    const int64_t offset_ns = static_cast<int64_t>(scan_time_offset_sec_ * 1000000000.0);
+    if (offset_ns > 0) {
+      const int32_t offset_sec = static_cast<int32_t>(offset_ns / 1000000000LL);
+      const uint32_t offset_nsec = static_cast<uint32_t>(offset_ns % 1000000000LL);
+      scan_stamp = scan_stamp - rclcpp::Duration(offset_sec, offset_nsec);
+    }
+    msg.header.stamp = scan_stamp;
+    msg.header.frame_id = frame_id_;
+
+    msg.angle_min = 0.0;
+    msg.angle_max = 2.0 * PI - (2.0 * PI / static_cast<double>(bins_));
+    msg.angle_increment = 2.0 * PI / static_cast<double>(bins_);
+    msg.time_increment = 0.0;
+    msg.scan_time = 1.0 / std::max(1.0, publish_hz_);
+    msg.range_min = range_min_;
+    msg.range_max = range_max_;
+
+    msg.ranges.resize(static_cast<size_t>(bins_));
+    msg.intensities.resize(static_cast<size_t>(bins_));
+
+    for (int i = 0; i < bins_; ++i)
+    {
+      const size_t k = static_cast<size_t>(i);
+      msg.ranges[k] = touched_[k] ? ranges_[k] : static_cast<float>(range_max_);
+      msg.intensities[k] = touched_[k] ? intensities_[k] : 0.0f;
+    }
+
+    pub_->publish(msg);
+
+    publish_count_++;
+    if ((publish_count_ % static_cast<uint64_t>(std::max(1.0, publish_hz_) * 5.0)) == 0)
+    {
+      RCLCPP_INFO(
+        get_logger(),
+        "D6 C++ published scan #%lu: bins=%d, packets=%lu, points=%lu",
+        static_cast<unsigned long>(publish_count_),
+        bins_,
+        static_cast<unsigned long>(packet_count_),
+        static_cast<unsigned long>(points_since_publish_));
+    }
+
+    std::fill(ranges_.begin(), ranges_.end(), static_cast<float>(range_max_));
+    std::fill(intensities_.begin(), intensities_.end(), 0.0f);
+    std::fill(touched_.begin(), touched_.end(), false);
+    points_since_publish_ = 0;
+  }
+
+private:
+  std::string port_;
+  int baud_{230400};
+  std::string frame_id_{"laser_link"};
+  std::string topic_{"/scan"};
+  double publish_hz_{10.0};
+  double read_period_s_{0.005};
+  int bins_{360};
+  double range_min_{0.02};
+  double range_max_{15.0};
+  int min_points_before_publish_{120};
+  bool publish_empty_scan_{true};
+
+  int fd_{-1};
+  std::deque<uint8_t> buf_;
+
+  double scan_time_offset_sec_{0.30};
+  rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr pub_;
+  rclcpp::TimerBase::SharedPtr read_timer_;
+  rclcpp::TimerBase::SharedPtr publish_timer_;
+
+  std::vector<float> ranges_;
+  std::vector<float> intensities_;
+  std::vector<bool> touched_;
+
+  uint64_t packet_count_{0};
+  uint64_t publish_count_{0};
+  uint64_t points_since_publish_{0};
+};
+
+int main(int argc, char **argv)
+{
+  rclcpp::init(argc, argv);
+  try
+  {
+    rclcpp::spin(std::make_shared<D6LidarCpp>());
+  }
+  catch (const std::exception &e)
+  {
+    std::cerr << "d6_lidar_cpp fatal: " << e.what() << std::endl;
+    rclcpp::shutdown();
+    return 1;
+  }
+  rclcpp::shutdown();
+  return 0;
+}

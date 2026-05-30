@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Remote RTX3050 vision server controller.
+
+Runs on Phytium Pi.
+
+Two remote control methods are supported:
+
+1. HTTP control server, recommended for Windows RTX3050 host.
+   The Windows host runs:
+       remote_vision_http_control_server.py
+   Phytium Pi calls:
+       http://192.168.43.163:8090/start
+       http://192.168.43.163:8090/stop
+       http://192.168.43.163:8090/status
+
+2. SSH, kept as fallback for Linux/Windows with OpenSSH Server enabled.
+
+Default for this package is HTTP because Windows OpenSSH optional feature may fail to install.
+"""
+
+import json
+import os
+import subprocess
+import time
+import urllib.parse
+import urllib.request
+from typing import Dict
+
+
+
+def _sanitize_target_class(value):
+    t = str(value or 'person').strip().lower()
+    t = ''.join(ch for ch in t if ch.isalnum() or ch in ('_', '-'))
+    return t or 'person'
+
+
+def _bool_value(v, default=False):
+    if v is None:
+        return default
+    return str(v).strip().lower() in ('1', 'true', 'yes', 'on', 'y')
+
+
+class RemoteVisionController:
+    def __init__(self, log_dir='/tmp/phytium_web_tasks'):
+        self.log_dir = log_dir
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_path = os.path.join(self.log_dir, 'remote_vision.log')
+        self.config = self._load_config()
+
+    def _load_config(self) -> Dict[str, str]:
+        cfg = {}
+
+        cfg_path = os.environ.get('PHYTIUM_REMOTE_VISION_CONFIG', '/home/user/.phytium_remote_vision.env')
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#') or '=' not in line:
+                            continue
+                        k, v = line.split('=', 1)
+                        cfg[k.strip()] = v.strip().strip('"').strip("'")
+            except Exception:
+                pass
+
+        for k, v in os.environ.items():
+            if k.startswith('PHYTIUM_REMOTE_VISION_'):
+                cfg[k] = v
+
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_ENABLED', '1')
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_REQUIRED', '0')
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_STOP_ON_EXIT', '0')
+
+        # Recommended default for Windows host.
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_METHOD', 'http')
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_CONTROL_URL', 'http://192.168.43.163:8090')
+
+        # YOLO web/API URL.
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_BASE_URL', 'http://192.168.43.163:8080')
+
+        # SSH fallback settings.
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_SSH_TARGET', '14596@192.168.43.163')
+
+        default_start_cmd = """powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*yolo_bbox_server.py*' }) { Write-Output 'already_running' } else { Start-Process -WindowStyle Hidden -WorkingDirectory 'C:\\Users\\14596\\Desktop' -FilePath 'py' -ArgumentList '-3.10', '.\\scripts_rtx3050\\yolo_bbox_server.py', '--model', '.\\scripts_rtx3050\\yolov8.engine', '--rgb-port', '9999', '--flyt-pi-host', '192.168.43.41', '--bbox-port', '9997', '--target-class', 'person', '--conf', '0.45' -RedirectStandardOutput 'C:\\Users\\14596\\Desktop\\scripts_rtx3050\\yolo_server_out.log' -RedirectStandardError 'C:\\Users\\14596\\Desktop\\scripts_rtx3050\\yolo_server_err.log'; Write-Output 'started' }" """
+        default_stop_cmd = """powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*yolo_bbox_server.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Write-Output 'stopped'" """
+
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_START_CMD', default_start_cmd)
+        cfg.setdefault('PHYTIUM_REMOTE_VISION_STOP_CMD', default_stop_cmd)
+
+        return cfg
+
+    @property
+    def enabled(self) -> bool:
+        return _bool_value(self.config.get('PHYTIUM_REMOTE_VISION_ENABLED'), True)
+
+    @property
+    def required(self) -> bool:
+        return _bool_value(self.config.get('PHYTIUM_REMOTE_VISION_REQUIRED'), False)
+
+    @property
+    def stop_on_exit(self) -> bool:
+        return _bool_value(self.config.get('PHYTIUM_REMOTE_VISION_STOP_ON_EXIT'), False)
+
+    @property
+    def method(self) -> str:
+        return str(self.config.get('PHYTIUM_REMOTE_VISION_METHOD', 'http')).strip().lower()
+
+    def status(self) -> Dict:
+        health = self.health_check(timeout=1.2)
+        ctl = self.control_status(timeout=1.2)
+        return {
+            'enabled': self.enabled,
+            'required': self.required,
+            'stop_on_exit': self.stop_on_exit,
+            'method': self.method,
+            'control_url': self.config.get('PHYTIUM_REMOTE_VISION_CONTROL_URL'),
+            'ssh_target': self.config.get('PHYTIUM_REMOTE_VISION_SSH_TARGET'),
+            'base_url': self.config.get('PHYTIUM_REMOTE_VISION_BASE_URL'),
+            'online': health.get('ok', False),
+            'health': health,
+            'control': ctl,
+            'log_path': self.log_path,
+        }
+
+    def start(self, target_class='person', force_restart=False) -> Dict:
+        target_class = _sanitize_target_class(target_class)
+
+        if not self.enabled:
+            return {'ok': True, 'enabled': False, 'status': 'disabled', 'target_class': target_class}
+
+        # For HTTP control, always call /start with target_class.
+        # The Windows 8090 controller decides whether to reuse or restart the YOLO process.
+        if self.method == 'http':
+            cmd_result = self._http_control(
+                '/start',
+                timeout=50.0,
+                payload={
+                    'target_class': target_class,
+                    'force_restart': bool(force_restart),
+                },
+            )
+        else:
+            before = self.health_check(timeout=1.0)
+            if before.get('ok') and not force_restart:
+                return {
+                    'ok': True,
+                    'enabled': True,
+                    'status': 'already_online',
+                    'target_class': target_class,
+                    'health': before,
+                }
+            cmd_result = self._ssh_run(self.config.get('PHYTIUM_REMOTE_VISION_START_CMD'), timeout=10.0)
+
+        self._log('START', cmd_result)
+
+        health = {}
+        deadline = time.time() + 18.0
+        while time.time() < deadline:
+            health = self.health_check(timeout=1.0)
+            if health.get('ok'):
+                break
+            time.sleep(0.7)
+
+        ok = bool(cmd_result.get('ok')) and bool(health.get('ok'))
+
+        if cmd_result.get('ok') and not health.get('ok') and not self.required:
+            return {
+                'ok': True,
+                'enabled': True,
+                'method': self.method,
+                'status': 'started_health_pending',
+                'control_result': cmd_result,
+                'health': health,
+                'required': self.required,
+            }
+
+        return {
+            'ok': ok,
+            'enabled': True,
+            'method': self.method,
+            'status': 'online' if ok else 'failed',
+            'control_result': cmd_result,
+            'health': health,
+            'required': self.required,
+        }
+
+    def stop(self) -> Dict:
+        if not self.enabled:
+            return {'ok': True, 'enabled': False, 'status': 'disabled'}
+
+        if not self.stop_on_exit:
+            return {'ok': True, 'enabled': True, 'status': 'kept_running', 'stop_on_exit': False}
+
+        if self.method == 'http':
+            result = self._http_control('/stop', timeout=5.0)
+        else:
+            result = self._ssh_run(self.config.get('PHYTIUM_REMOTE_VISION_STOP_CMD'), timeout=6.0)
+
+        self._log('STOP', result)
+        return {
+            'ok': bool(result.get('ok')),
+            'enabled': True,
+            'method': self.method,
+            'status': 'stopped' if result.get('ok') else 'failed',
+            'control_result': result,
+            'stop_on_exit': True,
+        }
+
+    def control_status(self, timeout=1.5) -> Dict:
+        if self.method != 'http':
+            return {'ok': None, 'method': self.method, 'reason': 'not_http_control'}
+        return self._http_control('/status', timeout=timeout)
+
+    def health_check(self, timeout=1.5) -> Dict:
+        base = (self.config.get('PHYTIUM_REMOTE_VISION_BASE_URL') or '').rstrip('/')
+        if not base:
+            return {'ok': False, 'reason': 'empty_base_url'}
+
+        urls = [base + '/api/stats', base + '/stats', base + '/health', base + '/']
+
+        last_error = ''
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'phytium-web/remote-vision'})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    code = getattr(resp, 'status', 200)
+                    body = resp.read(200).decode('utf-8', errors='ignore')
+                    if 200 <= code < 500:
+                        return {'ok': True, 'url': url, 'status': code, 'body_prefix': body[:120]}
+            except Exception as e:
+                last_error = str(e)
+
+        return {'ok': False, 'url': base, 'reason': last_error}
+
+    def _http_control(self, path: str, timeout=5.0, payload=None) -> Dict:
+        base = (self.config.get('PHYTIUM_REMOTE_VISION_CONTROL_URL') or '').rstrip('/')
+        if not base:
+            return {'ok': False, 'reason': 'empty_control_url'}
+
+        url = base + path
+        try:
+            method = 'POST' if path in ('/start', '/stop') else 'GET'
+            data = None
+            headers = {'User-Agent': 'phytium-web/remote-vision'}
+
+            if method == 'POST' and payload is not None:
+                data = json.dumps(payload).encode('utf-8')
+                headers['Content-Type'] = 'application/json; charset=utf-8'
+
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(4096).decode('utf-8', errors='ignore')
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {'raw': raw}
+                ok = 200 <= getattr(resp, 'status', 200) < 300 and bool(data.get('ok', True))
+                return {'ok': ok, 'url': url, 'status': getattr(resp, 'status', 200), 'data': data}
+        except Exception as e:
+            return {'ok': False, 'url': url, 'reason': str(e)}
+
+    def _ssh_run(self, remote_cmd: str, timeout=8.0) -> Dict:
+        target = self.config.get('PHYTIUM_REMOTE_VISION_SSH_TARGET')
+        if not target:
+            return {'ok': False, 'reason': 'empty_ssh_target'}
+
+        ssh_cmd = [
+            'ssh',
+            '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'ConnectTimeout=5',
+            target,
+            remote_cmd,
+        ]
+
+        try:
+            p = subprocess.run(
+                ssh_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            return {
+                'ok': p.returncode == 0,
+                'returncode': p.returncode,
+                'stdout': (p.stdout or '').strip(),
+                'stderr': (p.stderr or '').strip(),
+                'cmd': ' '.join(ssh_cmd[:7]) + ' ...',
+            }
+        except subprocess.TimeoutExpired:
+            return {'ok': False, 'returncode': -1, 'stderr': 'timeout'}
+        except Exception as e:
+            return {'ok': False, 'returncode': -2, 'stderr': str(e)}
+
+    def _log(self, action: str, data: Dict):
+        try:
+            with open(self.log_path, 'a', encoding='utf-8') as f:
+                f.write('\\n===== {} {} =====\\n'.format(action, time.strftime('%F %T')))
+                f.write(str(data) + '\\n')
+        except Exception:
+            pass

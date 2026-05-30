@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ROS2 bridge for phytium_web with direct Web control publishers."""
+
+import json
+import math
+import time
+import threading
+
+import rclpy
+from typing import List
+
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import OccupancyGrid, Odometry
+from rclpy.node import Node
+from sensor_msgs.msg import Imu, LaserScan
+from std_msgs.msg import Bool, String
+
+try:
+    import tf2_ros
+except Exception:
+    tf2_ros = None
+
+from .state_cache import StateCache
+
+
+def yaw_from_quat(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def norm_angle(a: float) -> float:
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+class RosBridge(Node):
+    def __init__(self, cache: StateCache):
+        super().__init__('web_backend')
+        self.cache = cache
+
+        self.declare_parameter('cmd_topic', '/cmd_vel_web')
+        self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('imu_topic', '/imu/data')
+        self.declare_parameter('collision_topic', '/collision')
+        self.declare_parameter('target_topic', '/perception/target')
+        self.declare_parameter('follow_cmd_topic', '/cmd_vel_follow')
+        self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('safety_status_topic', '/safety/status')
+        self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('map_downsample', 1)
+        self.declare_parameter('map_max_cells', 60000)
+        self.declare_parameter('map_min_period_sec', 0.50)
+
+        self.declare_parameter('mux_mode_cmd_topic', '/cmd_vel_mux/mode_cmd')
+        self.declare_parameter('mux_estop_topic', '/cmd_vel_mux/estop')
+        self.declare_parameter('safety_estop_topic', '/safety/estop')
+
+        self.declare_parameter('radar_max_range', 8.0)
+        self.declare_parameter('radar_min_range', 0.05)
+        self.declare_parameter('radar_downsample', 2)
+        self.declare_parameter('radar_front_sector_deg', 30.0)
+        self.declare_parameter('radar_side_sector_deg', 60.0)
+        self.declare_parameter('radar_flip_lr', True)
+
+        self.declare_parameter('max_linear', 0.20)
+        self.declare_parameter('max_angular', 0.60)
+        self.declare_parameter('web_control_rate_hz', 20.0)
+        self.declare_parameter('web_control_timeout_sec', 1.5)
+        self.declare_parameter('web_release_zero_sec', 0.25)
+
+        self.cmd_topic = str(self.get_parameter('cmd_topic').value)
+        self.max_linear = float(self.get_parameter('max_linear').value)
+        self.max_angular = float(self.get_parameter('max_angular').value)
+        self.web_control_rate_hz = max(1.0, float(self.get_parameter('web_control_rate_hz').value))
+        self.web_control_timeout_sec = max(0.2, float(self.get_parameter('web_control_timeout_sec').value))
+        self.web_release_zero_sec = max(0.05, float(self.get_parameter('web_release_zero_sec').value))
+
+        self._control_lock = threading.Lock()
+        self._hold_active = False
+        self._hold_linear = 0.0
+        self._hold_angular = 0.0
+        self._hold_stamp = 0.0
+        self._release_until = 0.0
+
+        self.radar_max_range = float(self.get_parameter('radar_max_range').value)
+        self.radar_min_range = float(self.get_parameter('radar_min_range').value)
+        self.radar_downsample = max(1, int(self.get_parameter('radar_downsample').value))
+        self.radar_front_half = math.radians(float(self.get_parameter('radar_front_sector_deg').value)) * 0.5
+        self.radar_side_half = math.radians(float(self.get_parameter('radar_side_sector_deg').value)) * 0.5
+        self.radar_flip_lr = bool(self.get_parameter('radar_flip_lr').value)
+
+        self.map_downsample = max(1, int(self.get_parameter('map_downsample').value))
+        self.map_max_cells = max(1000, int(self.get_parameter('map_max_cells').value))
+        self.map_min_period_sec = max(0.1, float(self.get_parameter('map_min_period_sec').value))
+        self.map_last_publish_time = 0.0
+        self.map_frame = str(self.get_parameter('map_frame').value)
+        self.base_frame = str(self.get_parameter('base_frame').value)
+        self.tf_buffer = None
+        self.tf_listener = None
+        if tf2_ros is not None:
+            try:
+                self.tf_buffer = tf2_ros.Buffer()
+                self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+            except Exception as e:
+                self.get_logger().warn(f'tf listener disabled: {e}')
+
+        self.cmd_pub = self.create_publisher(Twist, self.cmd_topic, 10)
+        self.mux_mode_pub = self.create_publisher(
+            String,
+            str(self.get_parameter('mux_mode_cmd_topic').value),
+            10
+        )
+        self.mux_estop_pub = self.create_publisher(
+            Bool,
+            str(self.get_parameter('mux_estop_topic').value),
+            10
+        )
+        self.safety_estop_pub = self.create_publisher(
+            Bool,
+            str(self.get_parameter('safety_estop_topic').value),
+            10
+        )
+
+        self.create_subscription(Odometry, str(self.get_parameter('odom_topic').value), self.odom_callback, 10)
+        self.create_subscription(Imu, str(self.get_parameter('imu_topic').value), self.imu_callback, 10)
+        self.create_subscription(Bool, str(self.get_parameter('collision_topic').value), self.collision_callback, 10)
+        self.create_subscription(String, str(self.get_parameter('target_topic').value), self.target_callback, 10)
+        self.create_subscription(Twist, str(self.get_parameter('follow_cmd_topic').value), self.follow_cmd_callback, 10)
+        self.create_subscription(LaserScan, str(self.get_parameter('scan_topic').value), self.scan_callback, 10)
+        self.create_subscription(String, str(self.get_parameter('safety_status_topic').value), self.safety_status_callback, 10)
+        self.create_subscription(OccupancyGrid, str(self.get_parameter('map_topic').value), self.map_callback, 2)
+
+        self.create_timer(1.0, self.node_watchdog)
+        self.create_timer(0.25, self.tf_pose_watchdog)
+        self.create_timer(1.0 / self.web_control_rate_hz, self.web_control_timer)
+
+        self.get_logger().info(
+            f'Web ROS bridge started, cmd_topic={self.cmd_topic}, '
+            f'mode_cmd={self.get_parameter("mux_mode_cmd_topic").value}, '
+            f'safety_topic={self.get_parameter("safety_status_topic").value}, '
+            f'map_topic={self.get_parameter("map_topic").value}, '
+            f'radar_flip_lr={self.radar_flip_lr}, '
+            f'web_control_rate={self.web_control_rate_hz}Hz'
+        )
+
+    # ========== Map / TF helpers ==========
+    @staticmethod
+    def _quat_yaw(q):
+        return math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
+
+    def tf_pose_watchdog(self):
+        """Update robot pose in map frame.
+
+        First version only displays pose. If TF is not ready, Web map still works.
+        """
+        if self.tf_buffer is None:
+            return
+
+        candidate_frames = [self.base_frame, 'base_footprint', 'base_link']
+
+        for base_frame in candidate_frames:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.map_frame,
+                    base_frame,
+                    rclpy.time.Time()
+                )
+
+                x = float(tf.transform.translation.x)
+                y = float(tf.transform.translation.y)
+                yaw = self._quat_yaw(tf.transform.rotation)
+
+                self.cache.merge('map', {
+                    'robot_pose_online': True,
+                    'robot_frame': base_frame,
+                    'robot_x': round(x, 4),
+                    'robot_y': round(y, 4),
+                    'robot_yaw': round(yaw, 5),
+                    'robot_yaw_deg': round(math.degrees(yaw), 2),
+                    'robot_pose_stamp': time.time(),
+                })
+                return
+
+            except Exception:
+                continue
+
+        self.cache.merge('map', {
+            'robot_pose_online': False,
+            'robot_pose_stamp': time.time(),
+        })
+
+    @staticmethod
+    def _origin_yaw(origin):
+        q = origin.orientation
+        return math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
+
+    def map_callback(self, msg: OccupancyGrid):
+        """Cache a downsampled OccupancyGrid for Web Canvas rendering."""
+        now = time.time()
+        if now - self.map_last_publish_time < self.map_min_period_sec:
+            return
+
+        self.map_last_publish_time = now
+
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        resolution = float(msg.info.resolution)
+
+        if width <= 0 or height <= 0 or resolution <= 0.0:
+            return
+
+        total = width * height
+        stride = self.map_downsample
+
+        while (width // stride + 1) * (height // stride + 1) > self.map_max_cells:
+            stride += 1
+
+        display_w = (width + stride - 1) // stride
+        display_h = (height + stride - 1) // stride
+
+        data = msg.data
+        sampled = []
+
+        # Nearest-cell downsample. This is fast and enough for Web preview.
+        for y in range(0, height, stride):
+            row_base = y * width
+            for x in range(0, width, stride):
+                sampled.append(int(data[row_base + x]))
+
+        origin = msg.info.origin
+
+        self.cache.merge('map', {
+            'online': True,
+            'topic': str(self.get_parameter('map_topic').value),
+            'frame_id': msg.header.frame_id,
+            'stamp_sec': float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9,
+            'stamp_wall': now,
+
+            'width': width,
+            'height': height,
+            'resolution': resolution,
+
+            'display_width': display_w,
+            'display_height': display_h,
+            'display_resolution': resolution * stride,
+            'downsample': stride,
+            'max_cells': self.map_max_cells,
+
+            'origin_x': float(origin.position.x),
+            'origin_y': float(origin.position.y),
+            'origin_yaw': self._origin_yaw(origin),
+
+            'data': sampled,
+            'data_count': len(sampled),
+        })
+
+    # ========== Web control publishers ==========
+    def publish_mux_mode(self, mux_mode: str):
+        msg = String()
+        msg.data = str(mux_mode)
+        self.mux_mode_pub.publish(msg)
+        self.get_logger().info(f'Web requested mux mode: {msg.data}')
+        return {'ok': True, 'mux_mode': msg.data, 'method': 'rclpy_publish'}
+
+    def publish_safety_estop(self, enabled: bool):
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.safety_estop_pub.publish(msg)
+        self.get_logger().warn(f'Web safety estop={msg.data}')
+        return {'ok': True, 'enabled': msg.data, 'topic': str(self.get_parameter("safety_estop_topic").value)}
+
+    def publish_mux_estop(self, enabled: bool):
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.mux_estop_pub.publish(msg)
+        self.get_logger().warn(f'Web mux estop={msg.data}')
+        return {'ok': True, 'enabled': msg.data, 'topic': str(self.get_parameter("mux_estop_topic").value)}
+
+    # ========== State callbacks ==========
+    def odom_callback(self, msg: Odometry):
+        yaw = yaw_from_quat(msg.pose.pose.orientation)
+        self.cache.merge('robot', {
+            'speed': round(float(msg.twist.twist.linear.x), 4),
+            'angular': round(float(msg.twist.twist.angular.z), 4),
+            'odom_x': round(float(msg.pose.pose.position.x), 4),
+            'odom_y': round(float(msg.pose.pose.position.y), 4),
+            'heading_deg': round(math.degrees(yaw), 2),
+            'odom_online': True,
+            'odom_stamp': time.time(),
+        })
+
+    def imu_callback(self, msg: Imu):
+        self.cache.merge('robot', {
+            'gyro_z': round(float(msg.angular_velocity.z), 5),
+            'imu_online': True,
+            'imu_stamp': time.time(),
+        })
+
+    def collision_callback(self, msg: Bool):
+        self.cache.merge('robot', {
+            'collision': bool(msg.data),
+            'collision_online': True,
+            'collision_stamp': time.time(),
+        })
+
+    def safety_status_callback(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except Exception as e:
+            data = {
+                'safe': False,
+                'reasons': ['bad_safety_json'],
+                'parse_error': str(e),
+            }
+
+        self.cache.merge('safety', {
+            'online': True,
+            'stamp': time.time(),
+            'safe': bool(data.get('safe', True)),
+            'reasons': data.get('reasons', []),
+            'estop': bool(data.get('estop', False)),
+            'active_source': data.get('active_source', ''),
+            'front_min': data.get('front_min', None),
+            'front_clearance': data.get('front_clearance', None),
+            'lidar_to_front_offset': data.get('lidar_to_front_offset', None),
+            'left_min': data.get('left_min', None),
+            'right_min': data.get('right_min', None),
+            'cmd_age_sec': data.get('cmd_age_sec', None),
+            'scan_age_sec': data.get('scan_age_sec', None),
+            'target_age_sec': data.get('target_age_sec', None),
+            'target_has': bool(data.get('target_has', False)),
+            'target_distance': data.get('target_distance', None),
+            'limited': data.get('limited', {}),
+            'out_linear': data.get('out_linear', 0.0),
+            'out_angular': data.get('out_angular', 0.0),
+            'raw': data,
+        })
+
+    def target_callback(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            data = {'has_target': False, 'reason': 'bad_json'}
+
+        self.cache.merge('vision', {
+            'has_target': bool(data.get('has_target', False)),
+            'reason': data.get('reason', ''),
+            'class_name': data.get('class_name', ''),
+            'conf': round(float(data.get('conf', 0.0)), 3),
+            'distance_m': data.get('distance_m', None),
+            'offset': round(float(data.get('offset', 0.0)), 3),
+            'cmd_linear': round(float(data.get('cmd_linear', 0.0)), 4),
+            'cmd_angular': round(float(data.get('cmd_angular', 0.0)), 4),
+            'target_online': True,
+            'target_stamp': time.time(),
+            'raw': data,
+        })
+
+    def follow_cmd_callback(self, msg: Twist):
+        self.cache.merge('vision', {
+            'follow_cmd_online': True,
+            'follow_linear': round(float(msg.linear.x), 4),
+            'follow_angular': round(float(msg.angular.z), 4),
+            'follow_stamp': time.time(),
+        })
+
+    @staticmethod
+    def safe_min(values: List[float]):
+        return min(values) if values else None
+
+    def scan_callback(self, msg: LaserScan):
+        stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        age_sec = max(0.0, now_sec - stamp_sec) if stamp_sec > 0 else None
+
+        points = []
+        nearest = None
+        nearest_point = None
+        front_vals, left_vals, right_vals = [], [], []
+
+        if self.radar_flip_lr:
+            left_center = -math.pi / 2.0
+            right_center = math.pi / 2.0
+        else:
+            left_center = math.pi / 2.0
+            right_center = -math.pi / 2.0
+
+        angle = msg.angle_min
+        for i, r in enumerate(msg.ranges):
+            if i % self.radar_downsample != 0:
+                angle += msg.angle_increment
+                continue
+
+            if math.isfinite(r):
+                rr = float(r)
+                if rr >= max(self.radar_min_range, float(msg.range_min)) and rr <= min(self.radar_max_range, float(msg.range_max)):
+                    x = rr * math.cos(angle)
+                    y_ros = rr * math.sin(angle)
+                    y_display = -y_ros if self.radar_flip_lr else y_ros
+                    p = {'x': round(x, 4), 'y': round(y_display, 4), 'r': round(rr, 4)}
+                    points.append(p)
+
+                    if nearest is None or rr < nearest:
+                        nearest = rr
+                        nearest_point = p
+
+                    a = norm_angle(angle)
+                    if abs(a) <= self.radar_front_half:
+                        front_vals.append(rr)
+                    if abs(norm_angle(a - left_center)) <= self.radar_side_half:
+                        left_vals.append(rr)
+                    if abs(norm_angle(a - right_center)) <= self.radar_side_half:
+                        right_vals.append(rr)
+
+            angle += msg.angle_increment
+
+        self.cache.merge('radar', {
+            'online': True,
+            'topic': str(self.get_parameter('scan_topic').value),
+            'frame_id': msg.header.frame_id,
+            'stamp_sec': stamp_sec,
+            'age_sec': round(age_sec, 3) if age_sec is not None else None,
+            'range_min': float(msg.range_min),
+            'range_max': float(msg.range_max),
+            'downsample': self.radar_downsample,
+            'flip_lr': self.radar_flip_lr,
+            'points': points,
+            'nearest_m': round(nearest, 4) if nearest is not None else None,
+            'nearest_point': nearest_point,
+            'front_nearest_m': round(self.safe_min(front_vals), 4) if front_vals else None,
+            'left_nearest_m': round(self.safe_min(left_vals), 4) if left_vals else None,
+            'right_nearest_m': round(self.safe_min(right_vals), 4) if right_vals else None,
+            'point_count_raw': len(msg.ranges),
+            'point_count_display': len(points),
+        })
+
+    # ========== Low-latency Web hold control ==========
+    def _make_cmd(self, linear, angular):
+        state = self.cache.snapshot()
+        if state.get('estop', False):
+            linear = 0.0
+            angular = 0.0
+
+        linear = max(-self.max_linear, min(self.max_linear, float(linear)))
+        angular = max(-self.max_angular, min(self.max_angular, float(angular)))
+
+        if abs(linear) < 0.005:
+            linear = 0.0
+        if abs(angular) < 0.01:
+            angular = 0.0
+
+        msg = Twist()
+        msg.linear.x = linear
+        msg.angular.z = angular
+        return msg
+
+    def set_web_hold(self, linear, angular):
+        """Set current hold command.
+
+        Called once from Flask when the user presses a control button.
+        A ROS2 timer then publishes /cmd_vel_web at a stable rate.
+        """
+        msg = self._make_cmd(linear, angular)
+
+        # Web manual control must also select cmd_vel_mux web mode.
+        # Release/soft stop should NOT switch mux to stop; only /api/mode stop or estop does that.
+        self.publish_mux_mode('web')
+
+        with self._control_lock:
+            self._hold_active = True
+            self._hold_linear = float(msg.linear.x)
+            self._hold_angular = float(msg.angular.z)
+            self._hold_stamp = time.time()
+            self._release_until = 0.0
+
+        # Publish immediately for fast first response.
+        self.cmd_pub.publish(msg)
+
+        return {
+            'ok': True,
+            'active': True,
+            'linear': self._hold_linear,
+            'angular': self._hold_angular,
+            'rate_hz': self.web_control_rate_hz,
+        }
+
+    def release_web_hold(self):
+        """Release current hold command and publish zero for a short period."""
+        now = time.time()
+
+        with self._control_lock:
+            self._hold_active = False
+            self._hold_linear = 0.0
+            self._hold_angular = 0.0
+            self._hold_stamp = now
+            self._release_until = now + self.web_release_zero_sec
+
+        self.cmd_pub.publish(Twist())
+
+        return {
+            'ok': True,
+            'active': False,
+            'zero_sec': self.web_release_zero_sec,
+        }
+
+    def web_control_timer(self):
+        """Stable 20Hz publisher for Web hold control.
+
+        This decouples real-time-ish chassis commands from browser HTTP timing.
+        """
+        now = time.time()
+
+        with self._control_lock:
+            active = self._hold_active
+            linear = self._hold_linear
+            angular = self._hold_angular
+            stamp = self._hold_stamp
+            release_until = self._release_until
+
+        if active:
+            if now - stamp <= self.web_control_timeout_sec:
+                self.publish_mux_mode('web')
+                self.cmd_pub.publish(self._make_cmd(linear, angular))
+            else:
+                # Safety fallback if Web pressed but never released.
+                with self._control_lock:
+                    self._hold_active = False
+                    self._hold_linear = 0.0
+                    self._hold_angular = 0.0
+                    self._release_until = now + self.web_release_zero_sec
+                self.cmd_pub.publish(Twist())
+            return
+
+        if now < release_until:
+            self.cmd_pub.publish(Twist())
+
+    def send_cmd(self, linear, angular):
+        self.cmd_pub.publish(self._make_cmd(linear, angular))
+
+    def stop(self):
+        self.release_web_hold()
+        self.cmd_pub.publish(Twist())
+
+    def node_watchdog(self):
+        try:
+            names = set(self.get_node_names())
+        except Exception:
+            names = set()
+
+        self.cache.merge('nodes', {
+            'uart_bridge': '/uart_bridge' in names or 'uart_bridge' in names,
+            'slam_toolbox': '/slam_toolbox' in names or 'slam_toolbox' in names,
+            'camera': any('camera' in n for n in names),
+            'rgb_sender': '/rgb_sender' in names or 'rgb_sender' in names,
+            'target_depth_follower': '/target_depth_follower' in names or 'target_depth_follower' in names,
+            'cmd_vel_mux': '/cmd_vel_mux' in names or 'cmd_vel_mux' in names,
+            'safety_guard': '/safety_guard' in names or 'safety_guard' in names,
+            'nav2': any(('bt_navigator' in n or 'controller_server' in n or 'planner_server' in n) for n in names),
+            'node_count': len(names),
+        })

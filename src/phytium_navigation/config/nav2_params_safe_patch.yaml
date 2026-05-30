@@ -1,0 +1,34 @@
+# nav2_params_safe_patch.yaml
+#
+# 这是一个“建议修改片段”，不是必须整文件替换。
+# 当前最重要的修改是：
+# 1. Nav2 输出已经在 nav2.launch.py 中重映射到 /cmd_vel_nav
+# 2. 速度最好与 safety_guard 的 max_forward/max_angular 接近，避免 Nav2 规划速度过激
+# 3. 测试阶段 local_costmap 可先只用 /scan，不接 /depth_obstacles
+#
+# 建议把你现有 nav2_params.yaml 中对应值改成：
+#
+# controller_server:
+#   ros__parameters:
+#     controller_frequency: 10.0
+#     FollowPath:
+#       max_vel_x: 0.10
+#       max_vel_theta: 0.35
+#       max_speed_xy: 0.10
+#       max_speed_theta: 0.35
+#       acc_lim_x: 0.20
+#       acc_lim_theta: 0.45
+#
+# local_costmap:
+#   local_costmap:
+#     ros__parameters:
+#       obstacle_layer:
+#         observation_sources: scan
+#         scan:
+#           topic: /scan
+#           max_obstacle_height: 0.3
+#           clearing: true
+#           marking: true
+#           data_type: "LaserScan"
+#
+# 如果你暂时只想验证 Nav2 能不能启动，可以先只替换 launch 文件，不动 nav2_params.yaml。

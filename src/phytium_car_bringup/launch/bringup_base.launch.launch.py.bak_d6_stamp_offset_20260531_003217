@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""基础启动：URDF TF + 底盘串口 + D6雷达"""
+
+import os
+
+from ament_index_python.packages import get_package_share_directory
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    pkg_dir = get_package_share_directory('phytium_car_bringup')
+    urdf_file = os.path.join(pkg_dir, 'urdf', 'phytium_car.urdf')
+
+    with open(urdf_file, 'r') as f:
+        robot_description = f.read()
+
+    stm32_port_arg = DeclareLaunchArgument(
+        'stm32_port',
+        default_value='/dev/phytium_stm32',
+        description='STM32 chassis serial port'
+    )
+
+    radar_port_arg = DeclareLaunchArgument(
+        'radar_port',
+        default_value='/dev/phytium_d6_lidar',
+        description='D6 lidar serial port'
+    )
+
+    robot_state_publisher_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'robot_description': robot_description,
+            'publish_frequency': 50.0,
+        }]
+    )
+
+    joint_state_publisher_node = Node(
+        package='joint_state_publisher',
+        executable='joint_state_publisher',
+        name='joint_state_publisher',
+        output='screen',
+        parameters=[{
+            'publish_default_positions': True,
+        }]
+    )
+
+    uart_bridge_node = Node(
+        package='phytium_car_cpp',
+        executable='uart_bridge_cpp',
+        name='uart_bridge',
+        output='screen',
+        parameters=[{
+            'port': LaunchConfiguration('stm32_port'),
+            'baudrate': 115200,
+
+            # 目前你的面包板阶段建议保留，防止异常编码器跳变带飞 odom
+            'max_tick_delta': 500,
+
+            # 里程计标定参数
+            'wheel_radius': 0.0192,
+            'wheel_base': 0.128,
+
+            # 正常启动时关闭，调试时可以 launch 覆盖为 true
+            'debug_odom': False,
+
+            # 当前裸测结果已经证明方向正确，先保持默认
+            'swap_encoders': False,
+            'left_encoder_sign': 1,
+            'right_encoder_sign': 1,
+            'invert_odom_yaw': False,
+
+            # uart_bridge 发布 odom -> base_footprint
+            'publish_tf': True,
+
+            'odom_frame_id': 'odom',
+            'base_frame_id': 'base_footprint',
+            'imu_frame_id': 'imu_link',
+        }]
+    )
+
+    d6_lidar_node = Node(
+        package='phytium_car_cpp',
+        executable='d6_lidar_cpp',
+        name='d6_lidar',
+        output='screen',
+        parameters=[{
+            'port': LaunchConfiguration('radar_port'),
+        }]
+    )
+
+
+    cmd_vel_mux_node = Node(
+        package='phytium_car_cpp',
+        executable='cmd_vel_mux_cpp',
+        name='cmd_vel_mux',
+        output='screen',
+        parameters=[{
+            # 输入：
+            #   /cmd_vel_web     Web手动控制
+            #   /cmd_vel_nav     导航控制
+            #   /cmd_vel_follow  视觉跟随控制
+            # 输出：
+            #   /cmd_vel_raw     给 safety_guard
+        }]
+    )
+
+    safety_guard_node = Node(
+        package='phytium_car_cpp',
+        executable='safety_guard_cpp',
+        name='safety_guard',
+        output='screen',
+        parameters=[{
+            # 输入：
+            #   /cmd_vel_raw
+            #   /scan
+            #   /stm32/status
+            # 输出：
+            #   /cmd_vel
+            #
+            # D6 雷达相对车头后移约 15cm，之前稳定版就是保留安全层补偿。
+            'lidar_to_front_offset': 0.15,
+        }]
+    )
+
+    return LaunchDescription([
+        stm32_port_arg,
+        radar_port_arg,
+
+        robot_state_publisher_node,
+        joint_state_publisher_node,
+        uart_bridge_node,
+        d6_lidar_node,
+        cmd_vel_mux_node,
+        safety_guard_node,
+    ])
