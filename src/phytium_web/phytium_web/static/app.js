@@ -147,7 +147,9 @@ function startHoldCmd(linear, angular, event) {
   holdCmdLinear = linear;
   holdCmdAngular = angular;
 
-  // First press: immediate command.
+  // First press: send one direct command immediately, then enter backend hold mode.
+  // This reduces the perceived delay of Web/keyboard driving.
+  cmd(holdCmdLinear, holdCmdAngular);
   holdControl(holdCmdLinear, holdCmdAngular, mySeq);
 
   // Keepalive: only current seq is allowed to keep sending motion commands.
@@ -155,7 +157,7 @@ function startHoldCmd(linear, angular, event) {
     if (!holdActive) return;
     if (mySeq !== holdSeq) return;
     holdControl(holdCmdLinear, holdCmdAngular, mySeq);
-  }, 150);
+  }, 80);
 }
 
 function stopHoldCmd(event) {
@@ -1593,3 +1595,221 @@ async function nav2RealPostJson(path, payload) {
   return data;
 }
 // ==== WEB NAV2 FETCH DEBUG PATCH END ====
+
+
+/* ==== EXACT DPAD KEYBOARD ANIMATION 20260601 BEGIN ==== */
+/*
+ * Only controls visual feedback.
+ * It does NOT send speed commands, so it will not affect existing Web/keyboard driving.
+ */
+(function () {
+  const PATCH_ID = 'exact_dpad_keyboard_animation_20260601_v1';
+  if (window[PATCH_ID]) return;
+  window[PATCH_ID] = true;
+
+  const KEY_TO_DIR = {
+    ArrowUp: 'forward',
+    w: 'forward',
+    W: 'forward',
+
+    ArrowDown: 'backward',
+    s: 'backward',
+    S: 'backward',
+
+    ArrowLeft: 'left',
+    a: 'left',
+    A: 'left',
+
+    ArrowRight: 'right',
+    d: 'right',
+    D: 'right'
+  };
+
+  function isEditableTarget(el) {
+    if (!el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+  }
+
+  function clearDpadAnim() {
+    document.querySelectorAll('.dpad button').forEach(btn => {
+      btn.classList.remove('drive-key-active');
+      btn.classList.remove('drive-feedback-active');
+      btn.classList.remove('drive-feedback-stop');
+      btn.classList.remove('keyboard-active');
+    });
+  }
+
+  function setDpadAnim(dir, on) {
+    clearDpadAnim();
+
+    if (!on || !dir) return;
+
+    const btn = document.querySelector(`.dpad button[data-dir="${dir}"]`);
+    if (!btn) {
+      console.warn('[dpad-anim] button not found:', dir);
+      return;
+    }
+
+    btn.classList.add('drive-key-active');
+    btn.classList.add('drive-feedback-active');
+    btn.classList.add('keyboard-active');
+
+    if (dir === 'stop') {
+      btn.classList.add('drive-feedback-stop');
+    }
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (isEditableTarget(e.target)) return;
+
+    if (e.key === ' ') {
+      setDpadAnim('stop', true);
+      setTimeout(clearDpadAnim, 260);
+      return;
+    }
+
+    const dir = KEY_TO_DIR[e.key];
+    if (!dir) return;
+
+    setDpadAnim(dir, true);
+  }, true);
+
+  document.addEventListener('keyup', function (e) {
+    if (isEditableTarget(e.target)) return;
+
+    if (e.key === ' ' || KEY_TO_DIR[e.key]) {
+      clearDpadAnim();
+    }
+  }, true);
+
+  window.addEventListener('blur', clearDpadAnim, true);
+
+  // Mouse/touch button visual feedback, matching the exact data-dir.
+  document.addEventListener('pointerdown', function (e) {
+    const btn = e.target && e.target.closest ? e.target.closest('.dpad button[data-dir]') : null;
+    if (!btn) return;
+
+    const dir = btn.dataset.dir;
+    setDpadAnim(dir, true);
+  }, true);
+
+  document.addEventListener('pointerup', clearDpadAnim, true);
+  document.addEventListener('pointercancel', clearDpadAnim, true);
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) clearDpadAnim();
+  }, true);
+})();
+/* ==== EXACT DPAD KEYBOARD ANIMATION 20260601 END ==== */
+
+
+/* ==== SPACE NORMAL STOP ONLY 20260601 BEGIN ==== */
+/*
+ * Space should only perform normal stop.
+ * It must NOT trigger focused button click, especially E-STOP.
+ */
+(function () {
+  const PATCH_ID = 'space_normal_stop_only_20260601_v1';
+  if (window[PATCH_ID]) return;
+  window[PATCH_ID] = true;
+
+  function isTextInput(el) {
+    if (!el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+  }
+
+  function normalStopBySpace(e) {
+    if (isTextInput(e.target)) return;
+
+    if (e.code !== 'Space' && e.key !== ' ') return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+
+    // Remove focus from buttons, otherwise browser may fire click on Space.
+    if (document.activeElement && document.activeElement.blur) {
+      try { document.activeElement.blur(); } catch (err) {}
+    }
+
+    if (typeof stopHoldCmd === 'function') {
+      try { stopHoldCmd(e); } catch (err) {}
+    }
+
+    const stopBtn = document.querySelector('.dpad button[data-dir="stop"]');
+    if (stopBtn) {
+      stopBtn.classList.add('drive-feedback-stop', 'drive-key-active', 'keyboard-active');
+      setTimeout(() => {
+        stopBtn.classList.remove('drive-feedback-stop', 'drive-key-active', 'keyboard-active');
+      }, 260);
+    }
+  }
+
+  document.addEventListener('keydown', normalStopBySpace, true);
+  document.addEventListener('keypress', normalStopBySpace, true);
+  document.addEventListener('keyup', function (e) {
+    if (isTextInput(e.target)) return;
+    if (e.code !== 'Space' && e.key !== ' ') return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+  }, true);
+})();
+/* ==== SPACE NORMAL STOP ONLY 20260601 END ==== */
+
+
+/* ==== ESTOP TOGGLE BUTTON 20260601 BEGIN ==== */
+(function () {
+  const PATCH_ID = 'estop_toggle_button_20260601_v1';
+  if (window[PATCH_ID]) return;
+  window[PATCH_ID] = true;
+
+  function getEstopEnabled() {
+    const safety = state && state.safety ? state.safety : {};
+    return !!(
+      safety.estop ||
+      safety.estop_enabled ||
+      safety.emergency_stop ||
+      safety.e_stop ||
+      safety.stop_enabled
+    );
+  }
+
+  window.toggleEstop = function () {
+    const next = !getEstopEnabled();
+
+    api('/api/estop', { enabled: next }).then(() => {
+      toast(next ? '急停已触发' : '急停已解除');
+      setTimeout(refresh, 300);
+    }).catch(() => {
+      toast('急停切换失败');
+    });
+  };
+
+  function updateEstopToggleButton() {
+    const btn = document.getElementById('estop-toggle-btn');
+    if (!btn) return;
+
+    const on = getEstopEnabled();
+    btn.textContent = on ? '解除急停' : '急停';
+    btn.classList.toggle('release-estop-state', on);
+    btn.classList.toggle('estop-active-state', on);
+  }
+
+  const oldRefresh = window.refresh;
+  if (typeof refresh === 'function') {
+    const originalRefresh = refresh;
+    refresh = async function () {
+      const ret = await originalRefresh.apply(this, arguments);
+      updateEstopToggleButton();
+      return ret;
+    };
+  }
+
+  window.addEventListener('load', function () {
+    updateEstopToggleButton();
+    setInterval(updateEstopToggleButton, 1000);
+  });
+})();
+/* ==== ESTOP TOGGLE BUTTON 20260601 END ==== */

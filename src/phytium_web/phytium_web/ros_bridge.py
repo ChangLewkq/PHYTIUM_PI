@@ -67,14 +67,14 @@ class RosBridge(Node):
         self.declare_parameter('max_angular', 0.60)
         self.declare_parameter('web_control_rate_hz', 20.0)
         self.declare_parameter('web_control_timeout_sec', 0.35)
-        self.declare_parameter('web_release_zero_sec', 0.12)
+        self.declare_parameter('web_release_zero_sec', 0.80)
 
         self.cmd_topic = str(self.get_parameter('cmd_topic').value)
         self.max_linear = float(self.get_parameter('max_linear').value)
         self.max_angular = float(self.get_parameter('max_angular').value)
         self.web_control_rate_hz = max(1.0, float(self.get_parameter('web_control_rate_hz').value))
         self.web_control_timeout_sec = max(0.2, float(self.get_parameter('web_control_timeout_sec').value))
-        self.web_release_zero_sec = max(0.05, float(self.get_parameter('web_release_zero_sec').value))
+        self.web_release_zero_sec = max(0.20, float(self.get_parameter('web_release_zero_sec').value))
 
         self._control_lock = threading.Lock()
         self._hold_active = False

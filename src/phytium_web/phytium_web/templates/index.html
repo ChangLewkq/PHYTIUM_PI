@@ -320,12 +320,12 @@
           <div class="switch-progress" id="switch-progress"><i id="switch-progress-bar"></i></div>
           <div class="switch-detail" id="switch-detail">等待模式切换</div>
         </div>
-        <p class="hint">热切换会自动检测任务是否就绪，并显示实际耗时。</p>
+        <p class="hint">冷启动会自动检测任务是否就绪，并显示实际耗时。</p>
       </div>
 
       <div class="card task-status-card">
         <div class="card-title">
-          <span>热切换任务</span>
+          <span>冷启动任务</span>
           <small>按需启动</small>
         </div>
 
@@ -360,7 +360,7 @@
         <div class="dpad">
           <button></button>
 
-          <button
+          <button data-dir="forward" aria-label="前进"
             onpointerdown="startHoldCmd(0.045, 0.0, event)"
             onpointerup="stopHoldCmd(event)"
             onpointerleave="stopHoldCmd(event)"
@@ -369,16 +369,16 @@
 
           <button></button>
 
-          <button
+          <button data-dir="left" aria-label="左转"
             onpointerdown="startHoldCmd(0.0, 0.250, event)"
             onpointerup="stopHoldCmd(event)"
             onpointerleave="stopHoldCmd(event)"
             onpointercancel="stopHoldCmd(event)"
           >◀</button>
 
-          <button onclick="stopHoldCmd(event)">停</button>
+          <button data-dir="stop" aria-label="停止" onclick="stopHoldCmd(event)">停</button>
 
-          <button
+          <button data-dir="right" aria-label="右转"
             onpointerdown="startHoldCmd(0.0, -0.250, event)"
             onpointerup="stopHoldCmd(event)"
             onpointerleave="stopHoldCmd(event)"
@@ -387,7 +387,7 @@
 
           <button></button>
 
-          <button
+          <button data-dir="backward" aria-label="后退"
             onpointerdown="startHoldCmd(-0.045, 0.0, event)"
             onpointerup="stopHoldCmd(event)"
             onpointerleave="stopHoldCmd(event)"
@@ -397,9 +397,8 @@
           <button></button>
         </div>
 
-        <div class="danger-row">
-          <button class="estop" onclick="estop()">急停</button>
-          <button class="release" onclick="releaseEstop()">解除</button>
+        <div class="danger-row single-estop-row">
+          <button id="estop-toggle-btn" class="estop" type="button" onclick="toggleEstop()">急停</button>
         </div>
 
         <p class="hint">按住方向键持续运动，松开立即停车；速度先进入 /cmd_vel_web，再经 mux 与 safety_guard。</p>

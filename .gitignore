@@ -16,3 +16,16 @@ __pycache__/
 *.key
 *.pem
 *.token
+
+# Local backup files
+*.bak
+*.bak_*
+*.backup
+*.old
+*.tmp
+
+# Runtime / debug leftovers
+calib_logs/
+stable_backup_*/
+*_ready_check_*.txt
+*_audit_*.txt

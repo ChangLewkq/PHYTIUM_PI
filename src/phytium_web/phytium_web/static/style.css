@@ -608,3 +608,47 @@ body.mode-follow .left-column #followTargetCard {
     overflow-y: visible;
   }
 }
+
+/* Keyboard/manual drive feedback */
+.dpad button.drive-key-active,
+.dpad button.drive-feedback-active {
+  background: #19a974 !important;
+  transform: scale(.98);
+  box-shadow: 0 0 0 3px rgba(34,197,94,.28), 0 0 18px rgba(34,197,94,.35);
+  border-color: rgba(34,197,94,.9) !important;
+}
+
+.dpad button.drive-feedback-stop {
+  background: #ef4444 !important;
+  box-shadow: 0 0 0 3px rgba(239,68,68,.28), 0 0 18px rgba(239,68,68,.35);
+}
+
+/* Exact D-pad keyboard/mouse active animation */
+.dpad button.keyboard-active,
+.dpad button.drive-key-active,
+.dpad button.drive-feedback-active {
+  background: #19a974 !important;
+  transform: scale(.96) !important;
+  box-shadow: 0 0 0 3px rgba(34,197,94,.30), 0 0 20px rgba(34,197,94,.42) !important;
+  border-color: rgba(34,197,94,.95) !important;
+}
+
+.dpad button.drive-feedback-stop {
+  background: #ef4444 !important;
+  box-shadow: 0 0 0 3px rgba(239,68,68,.30), 0 0 20px rgba(239,68,68,.42) !important;
+  border-color: rgba(239,68,68,.95) !important;
+}
+
+/* Single E-STOP toggle button */
+.single-estop-row {
+  grid-template-columns: 1fr !important;
+}
+
+#estop-toggle-btn.release-estop-state {
+  background: linear-gradient(135deg,#334155,#166534) !important;
+  box-shadow: 0 0 24px rgba(34,197,94,.22) !important;
+}
+
+#estop-toggle-btn.estop-active-state {
+  border: 1px solid rgba(34,197,94,.75);
+}
