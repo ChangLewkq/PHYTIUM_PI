@@ -1,30 +1,58 @@
+﻿# ROS2 build outputs
 build/
 install/
 log/
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+# Runtime logs / temp
 *.log
-.vscode/
-.idea/
+/tmp/
 *.bag
 *.db3
-*.mp4
-*.avi
-*.pt
-*.engine
-.env
-*.key
-*.pem
-*.token
-
 # Local backup files
 *.bak
 *.bak_*
 *.backup
 *.old
 *.tmp
-
-# Runtime / debug leftovers
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+# Large/generated files
+*.mp4
+*.avi
+*.mkv
+*.onnx
+*.engine
+*.pt
+# Secrets
+*.pem
+*.key
+*.token
+.env
+# STM32 / Keil build outputs
+stm32/Objects/
+stm32/Listings/
+stm32/.vscode/
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.map
+*.lst
+*.lnp
+*.dep
+*.uvguix.*
+*.htm
+*.lock
+# Local debug leftovers
 calib_logs/
 stable_backup_*/
 *_ready_check_*.txt
